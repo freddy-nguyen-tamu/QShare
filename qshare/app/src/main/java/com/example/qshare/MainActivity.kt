@@ -1,5 +1,7 @@
 package com.example.qshare
 
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import android.content.ContentResolver
 import android.net.Uri
 import android.net.nsd.NsdManager
@@ -11,7 +13,7 @@ import android.widget.Button
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.ComponentActivity
+import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
@@ -24,7 +26,7 @@ import java.io.InputStream
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var listView: ListView
