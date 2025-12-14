@@ -2,11 +2,10 @@ import os
 import socket
 import threading
 import time
-from datetime import datetime
+import subprocess
 
 from flask import Flask, jsonify, request, send_from_directory, abort
 from werkzeug.utils import secure_filename
-
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 APP_NAME = "QShare"
@@ -20,19 +19,93 @@ os.makedirs(SHARED_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024 * 1024  # 5GB
 
-def get_local_ip() -> str:
+
+# -------------------- helpers --------------------
+
+def is_wsl() -> bool:
+    try:
+        with open("/proc/version", "r", encoding="utf-8") as f:
+            v = f.read().lower()
+        return "microsoft" in v or "wsl" in v
+    except Exception:
+        return False
+
+
+def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+def get_wsl_ip() -> str:
+    # IP of the WSL distro (usually 172.17.x.x or similar)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def get_windows_wifi_ip() -> str | None:
     """
-    Finds the LAN IP used to reach the local network.
-    This avoids 127.0.0.1 and usually picks your Wi-Fi adapter.
+    From WSL: ask Windows for the Wi-Fi IPv4.
+    """
+    ps = r"""
+$ip = Get-NetIPAddress -AddressFamily IPv4 |
+  Where-Object { $_.InterfaceAlias -match 'Wi-Fi' -and $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '127.0.0.1' } |
+  Select-Object -ExpandProperty IPAddress -First 1
+$ip
+"""
+    code, out, _ = run_cmd(["powershell.exe", "-NoProfile", "-Command", ps])
+    if code == 0 and out:
+        return out.strip()
+    return None
+
+
+def get_native_ip() -> str:
+    """
+    For native Linux: choose interface used for outbound routing.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Doesn't need to be reachable; just forces OS to choose an interface
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
+        return s.getsockname()[0]
     finally:
         s.close()
-    return ip
+
+
+# -------------------- Windows port forwarding (WSL) --------------------
+
+def ensure_windows_portproxy(listen_ip: str, listen_port: int, wsl_ip: str, wsl_port: int) -> None:
+    """
+    On WSL: forward Windows listen_ip:listen_port -> wsl_ip:wsl_port.
+    Requires elevated privileges on Windows; if not admin, we print commands.
+    """
+    del_cmd = f'netsh interface portproxy delete v4tov4 listenport={listen_port} listenaddress={listen_ip}'
+    add_cmd = f'netsh interface portproxy add v4tov4 listenport={listen_port} listenaddress={listen_ip} connectport={wsl_port} connectaddress={wsl_ip}'
+    fw_cmd  = f'netsh advfirewall firewall add rule name="QShare {listen_port}" dir=in action=allow protocol=TCP localport={listen_port}'
+
+    # Try to run (may fail if not admin)
+    subprocess.run(["powershell.exe", "-NoProfile", "-Command", del_cmd], capture_output=True, text=True)
+    add = subprocess.run(["powershell.exe", "-NoProfile", "-Command", add_cmd], capture_output=True, text=True)
+    fw  = subprocess.run(["powershell.exe", "-NoProfile", "-Command", fw_cmd], capture_output=True, text=True)
+
+    if add.returncode != 0 or fw.returncode != 0:
+        print("\n[QShare] Detected WSL. Windows port forwarding is required so your phone can reach the server.")
+        print("[QShare] Could not configure portproxy/firewall automatically (needs Admin).")
+        print("\nRun this ONE TIME in an *elevated* PowerShell (Run as Administrator):\n")
+        print(f"  {del_cmd}")
+        print(f"  {add_cmd}")
+        print(f"  {fw_cmd}\n")
+        if add.stderr:
+            print("[QShare] portproxy error:", add.stderr.strip())
+        if fw.stderr:
+            print("[QShare] firewall error:", fw.stderr.strip())
+    else:
+        print(f"\n[QShare] Windows portproxy OK: {listen_ip}:{listen_port} -> {wsl_ip}:{wsl_port}")
+
+
+# -------------------- file listing & API --------------------
 
 def list_shared_files():
     items = []
@@ -48,9 +121,11 @@ def list_shared_files():
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return items
 
+
 @app.get("/api/ping")
 def ping():
     return jsonify({"ok": True, "name": APP_NAME, "time": int(time.time())})
+
 
 @app.get("/api/list")
 def api_list():
@@ -60,6 +135,7 @@ def api_list():
         "serverTime": int(time.time())
     })
 
+
 @app.get("/download/<path:filename>")
 def download(filename):
     safe_name = os.path.basename(filename)
@@ -67,6 +143,7 @@ def download(filename):
     if not os.path.isfile(file_path):
         abort(404)
     return send_from_directory(SHARED_DIR, safe_name, as_attachment=True)
+
 
 @app.post("/upload")
 def upload():
@@ -82,7 +159,6 @@ def upload():
 
     out_path = os.path.join(SHARED_DIR, filename)
 
-    # Avoid overwriting by default: foo.txt -> foo (1).txt
     if os.path.exists(out_path):
         base, ext = os.path.splitext(filename)
         i = 1
@@ -97,15 +173,15 @@ def upload():
     f.save(out_path)
     return jsonify({"ok": True, "savedAs": filename})
 
-def register_mdns_service(host_ip: str, port: int):
-    """
-    Advertise the current IP:port as a Zeroconf service so the phone can find it.
-    """
+
+# -------------------- mDNS registration --------------------
+
+def register_mdns_service(advertise_ip: str, port: int):
     zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
     info = ServiceInfo(
         type_=SERVICE_TYPE,
         name=SERVICE_NAME,
-        addresses=[socket.inet_aton(host_ip)],
+        addresses=[socket.inet_aton(advertise_ip)],
         port=port,
         properties={
             b"path": b"/",
@@ -118,7 +194,8 @@ def register_mdns_service(host_ip: str, port: int):
     zeroconf.register_service(info)
 
     print(f"\n[{APP_NAME}] mDNS advertised as: {SERVICE_NAME}")
-    print(f"[{APP_NAME}] Open URL (example): http://{host_ip}:{port}")
+    print(f"[{APP_NAME}] Advertised IP: {advertise_ip}")
+    print(f"[{APP_NAME}] Open URL: http://{advertise_ip}:{port}")
     print(f"[{APP_NAME}] Shared folder: {SHARED_DIR}\n")
 
     try:
@@ -127,23 +204,41 @@ def register_mdns_service(host_ip: str, port: int):
     except KeyboardInterrupt:
         pass
     finally:
-        zeroconf.unregister_service(info)
+        try:
+            zeroconf.unregister_service(info)
+        except Exception:
+            pass
         zeroconf.close()
 
+
 def run():
-    host_ip = get_local_ip()
+    port = int(os.environ.get("QSHARE_PORT", "54837"))
 
-    # Bind to a free port by asking OS (port 0), then re-use it for Flask
-    temp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    temp.bind(("0.0.0.0", 0))
-    port = temp.getsockname()[1]
-    temp.close()
+    # ✅ Always respect explicit override first
+    advertise_ip = os.environ.get("QSHARE_IP", "").strip()
 
-    t = threading.Thread(target=register_mdns_service, args=(host_ip, port), daemon=True)
+    if is_wsl():
+        wsl_ip = get_wsl_ip()
+
+        if not advertise_ip:
+            # If user didn't override, auto-pick Windows Wi-Fi IP
+            win_ip = get_windows_wifi_ip()
+            advertise_ip = win_ip or wsl_ip
+
+        # If we are advertising a Windows LAN IP, ensure portproxy points to WSL
+        # (If advertise_ip == wsl_ip, portproxy isn't useful for the phone anyway)
+        if advertise_ip != wsl_ip:
+            ensure_windows_portproxy(advertise_ip, port, wsl_ip, port)
+
+    else:
+        if not advertise_ip:
+            advertise_ip = get_native_ip()
+
+    t = threading.Thread(target=register_mdns_service, args=(advertise_ip, port), daemon=True)
     t.start()
 
-    # Run Flask server
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
 
 if __name__ == "__main__":
     run()
